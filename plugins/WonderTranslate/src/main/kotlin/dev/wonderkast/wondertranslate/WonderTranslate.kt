@@ -3,6 +3,7 @@ package dev.wonderkast.wondertranslate
 import android.app.AlertDialog
 import android.content.Context
 import android.graphics.Color
+import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.os.Handler
@@ -13,9 +14,9 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.widget.LinearLayout
-import android.widget.RelativeLayout
+import android.view.ViewTreeObserver
 import android.widget.TextView
+import android.widget.FrameLayout
 import com.aliucord.CollectionUtils
 import com.aliucord.Utils
 import com.aliucord.annotations.AliucordPlugin
@@ -24,11 +25,11 @@ import com.aliucord.patcher.Hook
 import com.discord.stores.StoreStream
 import com.discord.utilities.view.text.SimpleDraweeSpanTextView
 import com.discord.widgets.chat.list.WidgetChatList
+import com.discord.databinding.WidgetChatListBinding
 import com.discord.widgets.chat.list.adapter.WidgetChatListAdapterItemMessage
 import com.discord.widgets.chat.list.entries.ChatListEntry
 import com.discord.widgets.chat.list.entries.MessageEntry
 import com.facebook.drawee.span.DraweeSpanStringBuilder
-import com.lytefast.flexinput.fragment.FlexInputFragment
 import java.lang.ref.WeakReference
 import java.util.LinkedHashMap
 import java.util.concurrent.LinkedBlockingQueue
@@ -96,6 +97,13 @@ class WonderTranslate : Plugin() {
     private var chat = WeakReference<WidgetChatList>(null)
     private var toggleButton = WeakReference<TextView>(null)
     private var buttonChannel: Long = -1L
+    // R16: The channel control is attached to the chat's visible area, not the composer.
+    // A read-only channel has no composer but still has WidgetChatList.
+    private var floatingHost: FrameLayout? = null
+    private var floatingAnchor: View? = null
+    private var floatingChat = WeakReference<WidgetChatList>(null)
+    private var floatingLayoutListener: ViewTreeObserver.OnGlobalLayoutListener? = null
+    private var floatingDetachListener: View.OnAttachStateChangeListener? = null
     @Volatile private var running = false
     @Volatile private var blockedUntil = 0L
 
@@ -114,7 +122,8 @@ class WonderTranslate : Plugin() {
         patchMessageText()
         patchVisibleMessages()
         patchChatList()
-        patchOneClickButton()
+        // The toggle no longer depends on FlexInputFragment.
+        // WidgetChatList.onViewBoundOrOnResume installs the floating control.
         // No chat commands and no manual diagnostics. Previously accepted consent is reused.
         // The probe only uses the public, fixed phrase "Hello world".
         main.post {
@@ -133,8 +142,7 @@ class WonderTranslate : Plugin() {
         work.shutdownNow()
         pending.clear()
         main.post {
-            toggleButton.get()?.let { (it.parent as? ViewGroup)?.removeView(it) }
-            toggleButton.clear()
+            removeFloatingButton()
             redrawLoadedMessages()
         }
         synchronized(cacheLock) { cache.clear() }
@@ -248,43 +256,115 @@ class WonderTranslate : Plugin() {
         TypedValue.COMPLEX_UNIT_DIP, value, ctx.resources.displayMetrics
     ).toInt()
 
-    private fun patchOneClickButton() {
-        // Confirmed Aliucord Legacy hook (FlexInputFragment's editor toolbar).
-        patcher.patch(
-            FlexInputFragment::class.java.getDeclaredMethod("onViewCreated", View::class.java, Bundle::class.java),
-            Hook { hook ->
-                try {
-                    val root = hook.args[0] as? LinearLayout ?: return@Hook
-                    val outer = root.getChildAt(1) as? RelativeLayout ?: return@Hook
-                    val toolbar = outer.getChildAt(0) as? LinearLayout ?: return@Hook
-                    val existing = toolbar.findViewWithTag<TextView>(BUTTON_TAG)
-                    val button = existing ?: TextView(toolbar.context).apply {
-                        tag = BUTTON_TAG
-                        gravity = Gravity.CENTER
-                        textSize = 11f
-                        setTextColor(Color.WHITE)
-                        setPadding(dp(context, 8f), 0, dp(context, 8f), 0)
-                        minWidth = dp(context, 55f)
-                        contentDescription = "Ativar ou desativar tradução do chat; pressione e segure para mudar idioma"
-                        setOnClickListener { requestToggle(selectedChannel(), this.context) }
-                        setOnLongClickListener { showLanguagePicker(this.context); true }
-                    }.also {
-                        toolbar.addView(
-                            it,
-                            LinearLayout.LayoutParams(
-                                ViewGroup.LayoutParams.WRAP_CONTENT,
-                                dp(toolbar.context, 36f),
-                            ),
-                        )
-                    }
-                    toggleButton = WeakReference(button)
-                    updateButton()
-                } catch (t: Throwable) {
-                    logger.error(t)
-                    // Keep previous state; the user can still disable this plugin in Aliucord settings.
+
+    // One chat-scoped floating action replaces the old composer button.
+    // By using the chat RecyclerView as the position/visibility anchor, this
+    // works in read-only, announcement and locked channels as well.
+    private fun attachFloatingButton(chatList: WidgetChatList) {
+        if (!running) return
+        try {
+            // This binding/accessor is used in Aliucord's SwipeToReply plugin.
+            val accessor = WidgetChatList::class.java.getDeclaredMethod("getBinding")
+                .apply { isAccessible = true }
+            val binding = accessor.invoke(chatList) as? WidgetChatListBinding ?: return
+            val anchor: View = binding.b
+            val host = Utils.appActivity.findViewById<FrameLayout>(android.R.id.content) ?: return
+            if (anchor === floatingAnchor && host === floatingHost && toggleButton.get() != null) {
+                positionFloatingButton()
+                return
+            }
+            removeFloatingButton()
+            val button = TextView(host.context).apply {
+                tag = BUTTON_TAG
+                gravity = Gravity.CENTER
+                textSize = 11f
+                setTextColor(Color.WHITE)
+                minWidth = dp(context, 64f)
+                setPadding(dp(context, 10f), 0, dp(context, 10f), 0)
+                elevation = dp(context, 4f).toFloat()
+                contentDescription = "Tradução do chat. Toque para alternar e segure para escolher idioma."
+                setOnClickListener { requestToggle(selectedChannel(), this.context) }
+                setOnLongClickListener { showLanguagePicker(this.context); true }
+            }
+            host.addView(button, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                dp(host.context, 34f),
+                Gravity.TOP or Gravity.END,
+            ))
+            floatingHost = host
+            floatingAnchor = anchor
+            floatingChat = WeakReference(chatList)
+            toggleButton = WeakReference(button)
+            buttonChannel = -1L
+            floatingLayoutListener = ViewTreeObserver.OnGlobalLayoutListener {
+                positionFloatingButton()
+            }.also { host.viewTreeObserver.addOnGlobalLayoutListener(it) }
+            floatingDetachListener = object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(v: View) {}
+                override fun onViewDetachedFromWindow(v: View) {
+                    main.post { if (floatingAnchor === v) removeFloatingButton() }
                 }
-            },
-        )
+            }.also { anchor.addOnAttachStateChangeListener(it) }
+            updateButton()
+            positionFloatingButton()
+        } catch (t: Throwable) {
+            logger.error(t)
+            removeFloatingButton()
+            // A failed UI hook never affects Discord messages or the existing plugin state.
+        }
+    }
+
+    private fun positionFloatingButton() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            main.post { positionFloatingButton() }
+            return
+        }
+        val host = floatingHost ?: return
+        val anchor = floatingAnchor ?: return
+        val button = toggleButton.get() ?: return
+        val visible = try {
+            running && floatingChat.get()?.isResumed == true && anchor.isShown && anchor.width > 0 &&
+                anchor.height > 0 && anchor.getGlobalVisibleRect(Rect()) && selectedChannel() > 0L
+        } catch (t: Throwable) {
+            logger.error(t)
+            false
+        }
+        val nextVisibility = if (visible) View.VISIBLE else View.GONE
+        if (button.visibility != nextVisibility) button.visibility = nextVisibility
+        if (!visible || host.width <= 0) return
+        val anchorXY = IntArray(2)
+        val hostXY = IntArray(2)
+        anchor.getLocationInWindow(anchorXY)
+        host.getLocationInWindow(hostXY)
+        val rightMargin = (host.width - (anchorXY[0] - hostXY[0] + anchor.width) +
+            dp(host.context, 12f)).coerceAtLeast(dp(host.context, 8f))
+        val topMargin = (anchorXY[1] - hostXY[1] + dp(host.context, 8f)).coerceAtLeast(0)
+        val params = button.layoutParams as? FrameLayout.LayoutParams ?: return
+        if (params.rightMargin != rightMargin || params.topMargin != topMargin) {
+            params.rightMargin = rightMargin
+            params.topMargin = topMargin
+            button.layoutParams = params
+        }
+    }
+
+    private fun removeFloatingButton() {
+        val host = floatingHost
+        val anchor = floatingAnchor
+        floatingLayoutListener?.let { listener ->
+            if (host?.viewTreeObserver?.isAlive == true) {
+                host.viewTreeObserver.removeOnGlobalLayoutListener(listener)
+            }
+        }
+        floatingDetachListener?.let { listener ->
+            anchor?.removeOnAttachStateChangeListener(listener)
+        }
+        toggleButton.get()?.let { (it.parent as? ViewGroup)?.removeView(it) }
+        toggleButton.clear()
+        floatingLayoutListener = null
+        floatingDetachListener = null
+        floatingHost = null
+        floatingAnchor = null
+        floatingChat.clear()
     }
 
     private fun updateButton() {
@@ -330,9 +410,11 @@ class WonderTranslate : Plugin() {
             persistDiagnostic()
         })
         patcher.patch(WidgetChatList::class.java, "onViewBoundOrOnResume", emptyArray<Class<*>>(), Hook { frame ->
-            chat = WeakReference(frame.thisObject as WidgetChatList)
+            val chatList = frame.thisObject as WidgetChatList
+            chat = WeakReference(chatList)
             lastReason = "CHAT_BOUND"
             persistDiagnostic(true)
+            main.post { if (running) attachFloatingButton(chatList) }
         })
     }
 
@@ -348,6 +430,7 @@ class WonderTranslate : Plugin() {
                     val message = (frame.args[1] as? MessageEntry)?.message ?: return@Hook
                     configureStage = "BUTTON"
                     updateButton()
+                    positionFloatingButton()
                     configureStage = "LOADING"
                     if (!running || message.isLoading) return@Hook
                     configureStage = "CHANNEL"
@@ -554,6 +637,6 @@ class WonderTranslate : Plugin() {
     }
 
     companion object {
-        private const val BUTTON_TAG = "wondertranslate:toggle"
+        private const val BUTTON_TAG = "wondertranslate:toggle:r16"
     }
 }
