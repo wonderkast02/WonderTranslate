@@ -1,0 +1,26 @@
+name: Build WonderTranslate
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+      - name: Install SDK 36
+        run: sdkmanager "platforms;android-36" "build-tools;35.0.0"
+      - name: Compile
+        run: bash build_from_template.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WonderTranslate-unsigned-development
+          path: .build/aliucord-template/plugins/WonderTranslate/build/outputs/WonderTranslate.zip
+          if-no-files-found: error

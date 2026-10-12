@@ -1,0 +1,23 @@
+# Gradle / Android / Kotlin
+.gradle/
+.build/
+**/build/
+**/builds/
+**/.gradle/
+**/local.properties
+**/*.iml
+.idea/
+/captures/
+*.log
+# Device diagnostics / tokens / secrets
+.env
+.env.*
+*.keystore
+*.jks
+*.p12
+*.pem
+*RETURN*.zip
+*HANDOFF*.txt
+*/backups/
+*/crashlogs/
+.DS_Store
