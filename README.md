@@ -8,7 +8,7 @@
 ![Estado](https://img.shields.io/badge/ESTADO-DESENVOLVIMENTO-F59E0B?style=for-the-badge)
 ![Plataforma](https://img.shields.io/badge/PLATAFORMA-ANDROID-3DDC84?style=for-the-badge)
 
-**Mensagens em outros idiomas, exibidas em português dentro do chat.**
+**Mensagens em outros idiomas, exibidas dentro do chat.**
 
 **[⬇️ Baixar WonderTranslate 0.1.4](downloads/WonderTranslate-0.1.4.zip)** · [Código-fonte](plugins/WonderTranslate/src/main/kotlin/dev/wonderkast/wondertranslate)
 
