@@ -12,7 +12,40 @@ internal class TranslationClient {
         data class Failure(val code: Int, val category: String = "HTTP_ERROR") : Result()
     }
 
-    fun translate(input: String, target: String): Result {
+    fun translate(input: String, target: String): Result =
+        translateWith(input, target, ::translatePlain)
+
+    // Testable without network: protected source tokens must never reach transport.
+    internal fun translateWith(input: String, target: String, transport: (String, String) -> Result): Result {
+        val plan = ProtectedMessage.parse(input)
+        if (!plan.structured) return transport(input, target)
+        if (plan.naturalParts == 0) return Result.Success(input)
+        // Fail closed on pathological markup, not dozens of HTTP requests.
+        if (plan.pieces.size > 80 || plan.naturalParts > 16) return Result.Success(input)
+        val masked = plan.masked()
+        if (!input.contains("⟦WT") && masked.length <= 1_300) {
+            val result = transport(masked, target)
+            if (result is Result.Success) {
+                val restored = plan.restore(result.text)
+                if (restored != null) return Result.Success(restored)
+                // If the service modifies/reorders a marker, retry only natural text.
+            } else return result
+        }
+        val translated = StringBuilder()
+        for (part in plan.pieces) {
+            if (part.protected || part.value.none(Char::isLetter)) {
+                translated.append(part.value)
+            } else {
+                val result = transport(part.value, target)
+                if (result !is Result.Success) return result
+                translated.append(result.text)
+            }
+        }
+        return Result.Success(translated.toString())
+    }
+
+    private fun translatePlain(input: String, target: String): Result {
+        if (input.isEmpty()) return Result.Success(input)
         val parts = splitMessage(input)
         val result = StringBuilder()
         for (part in parts) {

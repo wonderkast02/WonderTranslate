@@ -17,26 +17,35 @@ import android.view.ViewGroup
 import android.view.ViewTreeObserver
 import android.widget.TextView
 import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.RelativeLayout
+import com.lytefast.flexinput.fragment.FlexInputFragment
 import com.aliucord.CollectionUtils
 import com.aliucord.Utils
 import com.aliucord.annotations.AliucordPlugin
 import com.aliucord.entities.Plugin
 import com.aliucord.patcher.Hook
 import com.discord.stores.StoreStream
+import com.discord.utilities.permissions.PermissionUtils
 import com.discord.utilities.view.text.SimpleDraweeSpanTextView
 import com.discord.widgets.chat.list.WidgetChatList
 import com.discord.databinding.WidgetChatListBinding
+import com.discord.databinding.WidgetHomeBinding
+import com.discord.widgets.home.WidgetHome
+import com.discord.widgets.home.WidgetHomeHeaderManager
+import com.discord.widgets.home.WidgetHomeModel
 import com.discord.widgets.chat.list.adapter.WidgetChatListAdapterItemMessage
 import com.discord.widgets.chat.list.entries.ChatListEntry
 import com.discord.widgets.chat.list.entries.MessageEntry
 import com.facebook.drawee.span.DraweeSpanStringBuilder
 import java.lang.ref.WeakReference
 import java.util.LinkedHashMap
-import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.LinkedBlockingDeque
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -50,15 +59,37 @@ import java.util.concurrent.atomic.AtomicBoolean
 @Suppress("unused")
 class WonderTranslate : Plugin() {
     private data class Translated(val original: String, val language: String, val rendered: String)
+    private data class TextKey(val language: String, val content: String)
+    private data class RequestKey(val id: Long, val language: String, val original: String)
 
     private val main = Handler(Looper.getMainLooper())
     private val cache = object : LinkedHashMap<Long, Translated>(256, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, Translated>?): Boolean = size > 400
     }
     private val cacheLock = Any()
-    private val pending = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
-    private fun freshWorker() = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, LinkedBlockingQueue(240))
+    // In-memory only: originals stay in the app process, never in diagnostic files.
+    private val textCache = object : LinkedHashMap<TextKey, String>(192, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<TextKey, String>?): Boolean = size > 192
+    }
+    private val retryAfter = object : LinkedHashMap<RequestKey, Long>(240, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<RequestKey, Long>?): Boolean = size > 240
+    }
+    private val pending = java.util.concurrent.ConcurrentHashMap.newKeySet<RequestKey>()
+    // Exactly one worker for gentle rate-limiting. Visible messages enter at the head.
+    private val taskQueue = LinkedBlockingDeque<Runnable>(240)
+    private fun freshWorker() = ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, taskQueue).apply {
+        prestartAllCoreThreads()
+    }
     private var work = freshWorker()
+    private val textReuses = AtomicInteger()
+    private val staleDrops = AtomicInteger()
+    private val priorityPromotions = AtomicInteger()
+    private val queueEvictions = AtomicInteger()
+    private val throttledRequests = AtomicInteger()
+    private val waitTotalMs = AtomicLong()
+    private val waitSamples = AtomicInteger()
+    // Only one delayed resume is kept; callbacks are removed when plugin stops.
+    private var delayedRateResume: Runnable? = null
     private val configured = AtomicInteger()
     private val configureEntered = AtomicInteger()
     private val configureExceptions = AtomicInteger()
@@ -96,14 +127,21 @@ class WonderTranslate : Plugin() {
     private val api = TranslationClient()
     private var chat = WeakReference<WidgetChatList>(null)
     private var toggleButton = WeakReference<TextView>(null)
+    // R23: writable channels use the original composer control, read-only channels use floating fallback.
+    private var composerButton = WeakReference<TextView>(null)
     private var buttonChannel: Long = -1L
     // R16: The channel control is attached to the chat's visible area, not the composer.
     // A read-only channel has no composer but still has WidgetChatList.
     private var floatingHost: FrameLayout? = null
     private var floatingAnchor: View? = null
     private var floatingChat = WeakReference<WidgetChatList>(null)
+    // R28: independently bound to the home header, which also exists in announcement feeds.
+    private var homeHeaderAnchor = WeakReference<View>(null)
+    private var floatingOnHeader = false
     private var floatingLayoutListener: ViewTreeObserver.OnGlobalLayoutListener? = null
     private var floatingDetachListener: View.OnAttachStateChangeListener? = null
+    // Prevent repeated reattachment posts while RecyclerView rebinds rows.
+    private val floatingRecoveryQueued = AtomicBoolean(false)
     @Volatile private var running = false
     @Volatile private var blockedUntil = 0L
 
@@ -114,7 +152,11 @@ class WonderTranslate : Plugin() {
     }
 
     override fun start(context: Context) {
-        if (work.isShutdown) work = freshWorker() // R8: allow same-session reactivation
+        if (work.isShutdown) {
+            taskQueue.clear()
+            pending.clear()
+            work = freshWorker()
+        } // allow same-session reactivation
         running = true
         automaticProbeStarted.set(false)
         lastReason = "STARTED"
@@ -122,8 +164,9 @@ class WonderTranslate : Plugin() {
         patchMessageText()
         patchVisibleMessages()
         patchChatList()
-        // The toggle no longer depends on FlexInputFragment.
-        // WidgetChatList.onViewBoundOrOnResume installs the floating control.
+        try { patchHomeHeader() } catch (t: Throwable) { logger.error(t) }
+        try { patchComposerButton() } catch (t: Throwable) { logger.error(t) }
+        // Float remains available only when the composer is absent or hidden.
         // No chat commands and no manual diagnostics. Previously accepted consent is reused.
         // The probe only uses the public, fixed phrase "Hello world".
         main.post {
@@ -142,16 +185,22 @@ class WonderTranslate : Plugin() {
         work.shutdownNow()
         pending.clear()
         main.post {
+            delayedRateResume?.let { main.removeCallbacks(it) }
+            delayedRateResume = null
             removeFloatingButton()
+            homeHeaderAnchor.clear()
+            floatingChat.clear()
+            composerButton.get()?.let { (it.parent as? ViewGroup)?.removeView(it) }
+            composerButton.clear()
             redrawLoadedMessages()
         }
-        synchronized(cacheLock) { cache.clear() }
+        synchronized(cacheLock) { cache.clear(); textCache.clear(); retryAfter.clear() }
         lastReason = "STOPPED"
         persistDiagnostic(true)
     }
 
     // Only counters, status codes and fixed categories: NEVER message text, user IDs or channel IDs.
-    private fun diagnostic(): String = "R13; running=$running; enabled=${isEnabled(selectedChannel())}; consent=${settings.getBool("external_translation_consent", false)}; configured=${configured.get()}; hooks=${textHooks.get()}; hook_blank=${hookBlank.get()}; hook_text=${hookNonBlank.get()}; cfg_enter=${configureEntered.get()}; cfg_errs=${configureExceptions.get()}; cfg_stage=$configureStage; cfg_error=$configureError; txt_enter=${textEntered.get()}; txt_errs=${textExceptions.get()}; txt_stage=$textStage; txt_error=$textError; probe_error=$probeError; eligible=${eligible.get()}; skip_blank=${blankContent.get()}; skip_long=${oversizeContent.get()}; skip_cache=${cacheHits.get()}; skip_pending=${duplicates.get()}; queued=${scheduled.get()}; attempts=${startedRequests.get()}; success=${successes.get()}; failed=${failures.get()}; render=${displays.get()}; redraw=${redraws.get()}; no_chat=${noChat.get()}; probe=${probeAttempts.get()}; probe_ok=${probeSuccesses.get()}; probe_fail=${probeFailures.get()}; probe_last=$lastProbe; last=$lastReason"
+    private fun diagnostic(): String = "R20; running=$running; enabled=${isEnabled(selectedChannel())}; consent=${settings.getBool("external_translation_consent", false)}; configured=${configured.get()}; hooks=${textHooks.get()}; hook_blank=${hookBlank.get()}; hook_text=${hookNonBlank.get()}; cfg_enter=${configureEntered.get()}; cfg_errs=${configureExceptions.get()}; cfg_stage=$configureStage; cfg_error=$configureError; txt_enter=${textEntered.get()}; txt_errs=${textExceptions.get()}; txt_stage=$textStage; txt_error=$textError; probe_error=$probeError; eligible=${eligible.get()}; skip_blank=${blankContent.get()}; skip_long=${oversizeContent.get()}; skip_cache=${cacheHits.get()}; skip_pending=${duplicates.get()}; queued=${scheduled.get()}; attempts=${startedRequests.get()}; success=${successes.get()}; failed=${failures.get()}; render=${displays.get()}; redraw=${redraws.get()}; no_chat=${noChat.get()}; probe=${probeAttempts.get()}; probe_ok=${probeSuccesses.get()}; probe_fail=${probeFailures.get()}; probe_last=$lastProbe; r19_queue=${taskQueue.size}; r19_text_reuses=${textReuses.get()}; r19_stale=${staleDrops.get()}; r19_evicted=${queueEvictions.get()}; r19_promoted=${priorityPromotions.get()}; r19_rate_paused=${throttledRequests.get()}; r19_wait_avg_ms=${if (waitSamples.get() > 0) waitTotalMs.get() / waitSamples.get() else 0}; last=$lastReason"
 
     private fun persistDiagnostic(force: Boolean = false) {
         main.post {
@@ -241,6 +290,7 @@ class WonderTranslate : Plugin() {
         persistDiagnostic(true)
         updateButton()
         redrawLoadedMessages()
+        pruneQueuedTasks(if (active) channel else -1L)
         if (active) {
             startAutomaticProbe()
             primeLoadedChannel(channel)
@@ -257,19 +307,101 @@ class WonderTranslate : Plugin() {
     ).toInt()
 
 
-    // One chat-scoped floating action replaces the old composer button.
-    // By using the chat RecyclerView as the position/visibility anchor, this
-    // works in read-only, announcement and locked channels as well.
+    // Floating fallback when a writable composer is not visible.
+    // The RecyclerView anchor also works in read-only/announcement channels.
+    // Reuses the R13 Aliucord Legacy composer hook, verified on writable channels.
+    // Never inject into a read-only chat (there is no writable composer toolbar).
+    private fun patchComposerButton() {
+        patcher.patch(
+            FlexInputFragment::class.java.getDeclaredMethod("onViewCreated", View::class.java, Bundle::class.java),
+            Hook { hook ->
+                try {
+                    val root = hook.args[0] as? LinearLayout ?: return@Hook
+                    val outer = root.getChildAt(1) as? RelativeLayout ?: return@Hook
+                    val toolbar = outer.getChildAt(0) as? LinearLayout ?: return@Hook
+                    val existing = toolbar.findViewWithTag<TextView>(COMPOSER_TAG)
+                    val button = existing ?: TextView(toolbar.context).apply {
+                        tag = COMPOSER_TAG
+                        gravity = Gravity.CENTER
+                        textSize = 11f
+                        setTextColor(Color.WHITE)
+                        setPadding(dp(context, 8f), 0, dp(context, 8f), 0)
+                        minWidth = dp(context, 55f)
+                        contentDescription = "Tradução do chat; toque para alternar, segure para escolher idioma."
+                        setOnClickListener { requestToggle(selectedChannel(), this.context) }
+                        setOnLongClickListener { showLanguagePicker(this.context); true }
+                    }.also {
+                        toolbar.addView(it, LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.WRAP_CONTENT, dp(toolbar.context, 36f),
+                        ))
+                    }
+                    composerButton = WeakReference(button)
+                    updateButton()
+                    positionFloatingButton()
+                } catch (t: Throwable) {
+                    logger.error(t)
+                    // The floating control remains a fallback; never break Discord's composer.
+                }
+            },
+        )
+    }
+
+    // R28: The home header is configured even for read-only announcement feeds
+    // with a Follow button; unlike the RecyclerView it does not depend on a
+    // message row being rendered. This hook is also used by Aliucord plugins.
+    private fun patchHomeHeader() {
+        patcher.patch(
+            WidgetHomeHeaderManager::class.java,
+            "configure",
+            arrayOf(WidgetHome::class.java, WidgetHomeModel::class.java, WidgetHomeBinding::class.java),
+            Hook { frame ->
+                try {
+                    val model = frame.args[1] as? WidgetHomeModel ?: return@Hook
+                    if (model.channel == null) return@Hook
+                    val home = frame.args[0] as? WidgetHome ?: return@Hook
+                    val header: View = home.toolbar
+                    homeHeaderAnchor = WeakReference(header)
+                    main.post {
+                        if (running && homeHeaderAnchor.get() === header) {
+                            attachFloatingControl(header, true)
+                            updateButton()
+                        }
+                    }
+                } catch (t: Throwable) {
+                    logger.error(t)
+                    // Chat-list fallback remains available if this hook changes.
+                }
+            },
+        )
+    }
+
     private fun attachFloatingButton(chatList: WidgetChatList) {
         if (!running) return
+        floatingChat = WeakReference(chatList)
+        val header = homeHeaderAnchor.get()
+        if (header != null && header.isShown) {
+            attachFloatingControl(header, true)
+            return
+        }
         try {
-            // This binding/accessor is used in Aliucord's SwipeToReply plugin.
-            val accessor = WidgetChatList::class.java.getDeclaredMethod("getBinding")
-                .apply { isAccessible = true }
-            val binding = accessor.invoke(chatList) as? WidgetChatListBinding ?: return
-            val anchor: View = binding.b
+            val root = chatList.view
+            // The root is often more reliable than the recycler in special chat
+            // layouts. Only fall back to the recycler if no root is available.
+            val anchor: View = root ?: run {
+                val accessor = WidgetChatList::class.java.getDeclaredMethod("getBinding")
+                    .apply { isAccessible = true }
+                val binding = accessor.invoke(chatList) as? WidgetChatListBinding ?: return
+                binding.b
+            }
+            attachFloatingControl(anchor, false)
+        } catch (t: Throwable) { logger.error(t) }
+    }
+
+    private fun attachFloatingControl(anchor: View, headerMode: Boolean) {
+        if (!running) return
+        try {
             val host = Utils.appActivity.findViewById<FrameLayout>(android.R.id.content) ?: return
-            if (anchor === floatingAnchor && host === floatingHost && toggleButton.get() != null) {
+            if (anchor === floatingAnchor && host === floatingHost && toggleButton.get()?.parent === host) {
                 positionFloatingButton()
                 return
             }
@@ -293,16 +425,32 @@ class WonderTranslate : Plugin() {
             ))
             floatingHost = host
             floatingAnchor = anchor
-            floatingChat = WeakReference(chatList)
+            floatingOnHeader = headerMode
             toggleButton = WeakReference(button)
             buttonChannel = -1L
             floatingLayoutListener = ViewTreeObserver.OnGlobalLayoutListener {
                 positionFloatingButton()
             }.also { host.viewTreeObserver.addOnGlobalLayoutListener(it) }
             floatingDetachListener = object : View.OnAttachStateChangeListener {
-                override fun onViewAttachedToWindow(v: View) {}
+                // A RecyclerView may detach/re-attach while the same chat is
+                // still alive. Removing the floating button on every detach
+                // loses the control until another onViewBoundOrOnResume.
+                override fun onViewAttachedToWindow(v: View) {
+                    main.post {
+                        if (running && floatingAnchor === v) {
+                            updateButton()
+                            positionFloatingButton()
+                        }
+                    }
+                }
                 override fun onViewDetachedFromWindow(v: View) {
-                    main.post { if (floatingAnchor === v) removeFloatingButton() }
+                    main.post {
+                        if (floatingAnchor === v) {
+                            positionFloatingButton()
+                            // Reattach is performed by header configure or the
+                            // list hook; never show controls on a detached view.
+                        }
+                    }
                 }
             }.also { anchor.addOnAttachStateChangeListener(it) }
             updateButton()
@@ -314,6 +462,50 @@ class WonderTranslate : Plugin() {
         }
     }
 
+    // An anchor may be detached by Discord without another chat-onResume hook.
+    // Repair a missing button on subsequent message binds, once per UI cycle.
+    private fun recoverFloatingButtonIfMissing() {
+        if (!running) return
+        val button = toggleButton.get()
+        val header = homeHeaderAnchor.get()
+        val needHeader = header != null && header.isShown && header.isAttachedToWindow &&
+            floatingAnchor !== header
+        if (button != null && button.parent === floatingHost && !needHeader) return
+        if (!floatingRecoveryQueued.compareAndSet(false, true)) return
+        main.post {
+            try {
+                if (running) {
+                    val header = homeHeaderAnchor.get()
+                    if (header != null && header.isShown) attachFloatingControl(header, true)
+                    else chat.get()?.let { attachFloatingButton(it) }
+                }
+            } finally {
+                floatingRecoveryQueued.set(false)
+            }
+        }
+    }
+
+    // R24: decide which UI belongs to the selected channel from Discord's actual
+    // SEND_MESSAGES permissions; a visible stale composer is NOT sufficient.
+    // null means the store has not resolved the channel yet. In that case, use
+    // the real composer visibility as a transient fallback (including DMs).
+    private fun currentChannelWritable(): Boolean? {
+        return try {
+            // StoreChannelsSelected exposes this ID; Channel.id itself is private
+            // in the Aliucord Legacy Discord SDK and must never be read here.
+            val channelId = selectedChannel()
+            if (channelId <= 0L) return null
+            val channel = StoreStream.getChannelsSelected().selectedChannel
+            val permissions = StoreStream.getPermissions().permissionsByChannel[channelId]
+                ?: return null
+            PermissionUtils.INSTANCE.hasAccessWrite(channel, permissions)
+        } catch (_: Throwable) {
+            // Do not risk breaking the chat if an Aliucord fork changes its
+            // permission API. A missing permission is never logged with IDs.
+            null
+        }
+    }
+
     private fun positionFloatingButton() {
         if (Looper.myLooper() != Looper.getMainLooper()) {
             main.post { positionFloatingButton() }
@@ -322,9 +514,36 @@ class WonderTranslate : Plugin() {
         val host = floatingHost ?: return
         val anchor = floatingAnchor ?: return
         val button = toggleButton.get() ?: return
+        // Repair a list-root fallback when the channel header becomes visible,
+        // even if no new message row is bound. Schedule outside layout traversal.
+        val currentHeader = homeHeaderAnchor.get()
+        if (currentHeader != null && currentHeader !== anchor && currentHeader.isShown &&
+            currentHeader.isAttachedToWindow && floatingRecoveryQueued.compareAndSet(false, true)) {
+            main.post {
+                try {
+                    if (running && homeHeaderAnchor.get() === currentHeader)
+                        attachFloatingControl(currentHeader, true)
+                } finally { floatingRecoveryQueued.set(false) }
+            }
+            return
+        }
+        val writable = currentChannelWritable()
+        val composer = composerButton.get()
+        // Hide only OUR injected composer button in read-only channels. Discord's
+        // own input and permissions are never modified. Restore it on writable
+        // channels, including after fragment reuse and permission changes.
+        if (composer != null && composer.parent != null) {
+            val next = if (writable == false) View.GONE else View.VISIBLE
+            if (composer.visibility != next) composer.visibility = next
+        }
+        val composerUsable = writable != false && composer?.let {
+            it.parent != null && it.isShown && it.visibility == View.VISIBLE &&
+                it.getGlobalVisibleRect(Rect())
+        } == true
         val visible = try {
-            running && floatingChat.get()?.isResumed == true && anchor.isShown && anchor.width > 0 &&
-                anchor.height > 0 && anchor.getGlobalVisibleRect(Rect()) && selectedChannel() > 0L
+            running && anchor.isAttachedToWindow && anchor.isShown && anchor.width > 0 &&
+                anchor.height > 0 && anchor.getGlobalVisibleRect(Rect()) && selectedChannel() > 0L &&
+                !composerUsable
         } catch (t: Throwable) {
             logger.error(t)
             false
@@ -338,7 +557,10 @@ class WonderTranslate : Plugin() {
         host.getLocationInWindow(hostXY)
         val rightMargin = (host.width - (anchorXY[0] - hostXY[0] + anchor.width) +
             dp(host.context, 12f)).coerceAtLeast(dp(host.context, 8f))
-        val topMargin = (anchorXY[1] - hostXY[1] + dp(host.context, 8f)).coerceAtLeast(0)
+        // Header mode positions just BELOW the toolbar, never on top of the
+        // channel name/search controls. A chat-root anchor uses its normal top.
+        val topMargin = (anchorXY[1] - hostXY[1] +
+            (if (floatingOnHeader) anchor.height else 0) + dp(host.context, 8f)).coerceAtLeast(0)
         val params = button.layoutParams as? FrameLayout.LayoutParams ?: return
         if (params.rightMargin != rightMargin || params.topMargin != topMargin) {
             params.rightMargin = rightMargin
@@ -364,7 +586,8 @@ class WonderTranslate : Plugin() {
         floatingDetachListener = null
         floatingHost = null
         floatingAnchor = null
-        floatingChat.clear()
+        floatingOnHeader = false
+        // Retain the last chat-list reference for a safe fallback.
     }
 
     private fun updateButton() {
@@ -372,15 +595,27 @@ class WonderTranslate : Plugin() {
             main.post { updateButton() }
             return
         }
-        val button = toggleButton.get() ?: return
         val channel = selectedChannel()
         val enabled = isEnabled(channel)
-        if (buttonChannel == channel && button.text.toString() == (if (enabled) "🌐 ON" else "🌐 OFF")) return
+        val title = if (enabled) "🌐 ON" else "🌐 OFF"
+        if (buttonChannel != channel) pruneQueuedTasks(channel)
         buttonChannel = channel
-        button.text = if (enabled) "🌐 ON" else "🌐 OFF"
-        button.background = GradientDrawable().apply {
-            cornerRadius = dp(button.context, 14f).toFloat()
-            setColor(Color.parseColor(if (enabled) "#197E70" else "#394351"))
+        // Both buttons reflect the same per-channel setting even across fragment reuse.
+        updateButtonVisual(composerButton.get(), title, enabled)
+        updateButtonVisual(toggleButton.get(), title, enabled)
+        // Re-evaluate permission after a channel switch. On a read-only channel,
+        // the previous composer can remain attached to an off-screen fragment.
+        positionFloatingButton()
+    }
+
+    private fun updateButtonVisual(button: TextView?, title: String, enabled: Boolean) {
+        if (button == null || button.parent == null) return
+        if (button.text.toString() != title) {
+            button.text = title
+            button.background = GradientDrawable().apply {
+                cornerRadius = dp(button.context, 14f).toFloat()
+                setColor(Color.parseColor(if (enabled) "#197E70" else "#394351"))
+            }
         }
         button.contentDescription = "Tradução ${if (enabled) "ligada" else "desligada"} para ${target()}. Toque para alternar ou segure para escolher idioma."
     }
@@ -393,6 +628,7 @@ class WonderTranslate : Plugin() {
             .setTitle("Idioma de destino")
             .setSingleChoiceItems(names, current) { dialog, which ->
                 settings.setString("target_language", codes[which])
+                pruneQueuedTasks(selectedChannel())
                 persistDiagnostic(true)
                 dialog.dismiss()
                 redrawLoadedMessages()
@@ -429,6 +665,7 @@ class WonderTranslate : Plugin() {
                     configureStage = "READ_ENTRY"
                     val message = (frame.args[1] as? MessageEntry)?.message ?: return@Hook
                     configureStage = "BUTTON"
+                    recoverFloatingButtonIfMissing()
                     updateButton()
                     positionFloatingButton()
                     configureStage = "LOADING"
@@ -444,7 +681,7 @@ class WonderTranslate : Plugin() {
                     configureStage = "MESSAGE_CONTENT"
                     val content = message.content ?: ""
                     configureStage = "ENQUEUE"
-                    enqueue(id, channel, content)
+                    enqueue(id, channel, content, urgent = true)
                     configureStage = "DONE"
                     persistDiagnostic()
                 } catch (t: Throwable) {
@@ -476,7 +713,7 @@ class WonderTranslate : Plugin() {
                     val original = message.content.orEmpty()
                     if (original.length == 0) hookBlank.incrementAndGet() else hookNonBlank.incrementAndGet()
                     textStage = "ENQUEUE"
-                    enqueue(message.id, message.channelId, original)
+                    enqueue(message.id, message.channelId, original, urgent = true)
                     textStage = "CACHE"
                     val translation = synchronized(cacheLock) { cache[message.id] }
                     if (translation == null || translation.original != original || translation.language != target()) return@Hook
@@ -485,7 +722,11 @@ class WonderTranslate : Plugin() {
                     val view = frame.args[0] as? SimpleDraweeSpanTextView ?: return@Hook
                     val builder = textBuilderField.get(view) as? DraweeSpanStringBuilder ?: return@Hook
                     val sourceStart = builder.toString().indexOf(original)
-                    if (sourceStart >= 0) {
+                    // Rich Discord text may contain clickable mentions/links or spans.
+                    // Replacing its raw buffer can erase click targets, so retain the
+                    // original rendering and append a safe translation below it.
+                    // Plain messages keep the R19 in-place translation behavior.
+                    if (sourceStart >= 0 && !ProtectedMessage.parse(original).structured) {
                         builder.replace(sourceStart, sourceStart + original.length, translation.rendered)
                         val end = builder.length
                         builder.append("  🌐")
@@ -508,84 +749,183 @@ class WonderTranslate : Plugin() {
         )
     }
 
-    private fun enqueue(id: Long, channel: Long, original: String) {
-        if (original.length == 0) {
+    private fun scheduleRateLimitResume() {
+        main.post {
+            if (!running) return@post
+            delayedRateResume?.let { main.removeCallbacks(it) }
+            val resume = Runnable {
+                delayedRateResume = null
+                if (running && System.currentTimeMillis() >= blockedUntil &&
+                    floatingChat.get()?.isResumed == true) {
+                    val channel = selectedChannel()
+                    if (isEnabled(channel)) primeLoadedChannel(channel)
+                }
+            }
+            delayedRateResume = resume
+            main.postDelayed(resume, (blockedUntil - System.currentTimeMillis()).coerceAtLeast(1000L) + 250L)
+        }
+    }
+
+    // Drop queued jobs that no longer match the active channel and selected language.
+    // A currently running HTTP request cannot be cancelled safely here; its result is
+    // checked again before being placed in the message cache.
+    private fun pruneQueuedTasks(channel: Long) {
+        val language = target()
+        for (item in taskQueue.toList()) {
+            val task = item as? TranslationJob ?: continue
+            if (task.channel != channel || task.language != language || !isEnabled(task.channel)) {
+                if (taskQueue.remove(item)) {
+                    pending.remove(task.key)
+                    staleDrops.incrementAndGet()
+                }
+            }
+        }
+    }
+
+    private fun promoteQueued(key: RequestKey) {
+        for (item in taskQueue.toList()) {
+            val task = item as? TranslationJob ?: continue
+            if (task.key == key && taskQueue.remove(item)) {
+                if (taskQueue.offerFirst(item)) {
+                    priorityPromotions.incrementAndGet()
+                } else if (!taskQueue.offerLast(item)) {
+                    pending.remove(task.key)
+                    queueEvictions.incrementAndGet()
+                }
+                return
+            }
+        }
+    }
+
+    private inner class TranslationJob(
+        val key: RequestKey,
+        val channel: Long,
+        val queuedAt: Long,
+    ) : Runnable {
+        val language: String get() = key.language
+        override fun run() {
+            try {
+                if (!running || !isEnabled(channel) || selectedChannel() != channel || target() != language) {
+                    staleDrops.incrementAndGet()
+                    return
+                }
+                val now = System.currentTimeMillis()
+                if (now < blockedUntil) {
+                    throttledRequests.incrementAndGet()
+                    return // Never block the only worker for 90 seconds.
+                }
+                waitTotalMs.addAndGet((now - queuedAt).coerceAtLeast(0L))
+                waitSamples.incrementAndGet()
+                startedRequests.incrementAndGet()
+                lastReason = "REQUEST_STARTED"
+                persistDiagnostic(true)
+                when (val response = api.translate(key.original, language)) {
+                    is TranslationClient.Result.Success -> {
+                        successes.incrementAndGet()
+                        lastReason = "HTTP_OK"
+                        persistDiagnostic(true)
+                        if (!running || !isEnabled(channel) || target() != language || selectedChannel() != channel) return
+                        synchronized(cacheLock) {
+                            cache[key.id] = Translated(key.original, language, response.text)
+                            textCache[TextKey(language, key.original)] = response.text
+                            retryAfter.remove(key)
+                        }
+                        main.post {
+                            if (running && isEnabled(channel) && target() == language && selectedChannel() == channel) {
+                                redrawMessage(key.id)
+                            }
+                        }
+                    }
+                    is TranslationClient.Result.Failure -> {
+                        val isRateLimited = response.code == 429
+                        val deadline = System.currentTimeMillis() + if (isRateLimited) 90_000L else 20_000L
+                        synchronized(cacheLock) { retryAfter[key] = deadline }
+                        if (isRateLimited) {
+                            blockedUntil = deadline
+                            throttledRequests.incrementAndGet()
+                            scheduleRateLimitResume()
+                        }
+                        reportFailure(if (response.code > 0) "HTTP_${response.code}" else response.category)
+                    }
+                }
+                // Preserve gentle pacing, without a long, uninterruptible retry sleep.
+                Thread.sleep(350L)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            } catch (t: Throwable) {
+                reportFailure("WORKER_EXCEPTION")
+                logger.error(t)
+            } finally {
+                pending.remove(key)
+            }
+        }
+    }
+
+    private fun enqueue(id: Long, channel: Long, original: String, urgent: Boolean) {
+        if (original.isEmpty()) {
             blankContent.incrementAndGet()
-            lastReason = "SKIP_BLANK"
-            persistDiagnostic()
             return
         }
         if (original.length > TranslationClient.MAX_MESSAGE_CHARS) {
             oversizeContent.incrementAndGet()
-            lastReason = "SKIP_LONG"
-            persistDiagnostic()
             return
         }
+        if (!running || !isEnabled(channel) || selectedChannel() != channel) return
         eligible.incrementAndGet()
         val language = target()
-        val existing = synchronized(cacheLock) { cache[id] }
-        if (existing != null && existing.original == original && existing.language == language) {
-            cacheHits.incrementAndGet()
-            return
+        val key = RequestKey(id, language, original)
+        val now = System.currentTimeMillis()
+        val cachedText = synchronized(cacheLock) {
+            val existing = cache[id]
+            if (existing != null && existing.original == original && existing.language == language) {
+                cacheHits.incrementAndGet()
+                return
+            }
+            val cooldown = retryAfter[key]
+            if (cooldown != null && cooldown > now) return
+            val reuse = textCache[TextKey(language, original)]
+            if (reuse != null) cache[id] = Translated(original, language, reuse)
+            reuse
         }
-        if (!pending.add(id)) {
-            duplicates.incrementAndGet()
-            return
-        }
-        scheduled.incrementAndGet()
-        persistDiagnostic()
-        try {
-            work.execute {
-                try {
-                    if (!running || !isEnabled(channel)) return@execute
-                    val pause = blockedUntil - System.currentTimeMillis()
-                    if (pause > 0L) Thread.sleep(pause.coerceAtMost(90_000L))
-                    if (!running || !isEnabled(channel)) return@execute
-                    startedRequests.incrementAndGet()
-                    lastReason = "REQUEST_STARTED"
-                    persistDiagnostic(true)
-                    var response = api.translate(original, language)
-                    if (response is TranslationClient.Result.Failure && response.code == 429) {
-                        blockedUntil = System.currentTimeMillis() + 90_000L
-                        Utils.showToast("Limite de tradução: aguardando antes de retomar", true)
-                        Thread.sleep(90_000L)
-                        if (!running || !isEnabled(channel)) return@execute
-                        startedRequests.incrementAndGet()
-                        response = api.translate(original, language) // one controlled retry
-                    }
-                    when (response) {
-                        is TranslationClient.Result.Success -> {
-                            successes.incrementAndGet()
-                            lastReason = "HTTP_OK"
-                            persistDiagnostic(true)
-                            if (!running) return@execute
-                            synchronized(cacheLock) { cache[id] = Translated(original, language, response.text) }
-                            main.post {
-                                if (running && isEnabled(channel) && target() == language && selectedChannel() == channel) redrawMessage(id)
-                            }
-                        }
-                        is TranslationClient.Result.Failure -> {
-                            reportFailure(if (response.code > 0) "HTTP_${response.code}" else response.category)
-                            if (response.code == 429) {
-                                blockedUntil = System.currentTimeMillis() + 90_000L
-                                Utils.showToast("Tradução limitada pelo servidor; redução automática da frequência", true)
-                            }
-                        }
-                    }
-                    Thread.sleep(350L) // one worker, gentle request pacing
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                } catch (t: Throwable) {
-                    reportFailure("WORKER_EXCEPTION")
-                    logger.error(t)
-                } finally {
-                    pending.remove(id)
+        if (cachedText != null) {
+            textReuses.incrementAndGet()
+            main.post {
+                if (running && isEnabled(channel) && target() == language && selectedChannel() == channel) {
+                    redrawMessage(id)
                 }
             }
-        } catch (_: RejectedExecutionException) {
-            reportFailure("QUEUE_FULL_OR_SHUTDOWN")
-            pending.remove(id) // backpressure: will retry if user scrolls this message again
+            return
         }
+        if (now < blockedUntil) {
+            throttledRequests.incrementAndGet()
+            return
+        }
+        if (!pending.add(key)) {
+            duplicates.incrementAndGet()
+            if (urgent) promoteQueued(key)
+            return
+        }
+        if (work.isShutdown) {
+            pending.remove(key)
+            return
+        }
+        val job = TranslationJob(key, channel, now)
+        var accepted = if (urgent) taskQueue.offerFirst(job) else taskQueue.offerLast(job)
+        if (!accepted && urgent) {
+            // A visible, recent message replaces the oldest queued work.
+            val evicted = taskQueue.pollLast() as? TranslationJob
+            if (evicted != null) {
+                pending.remove(evicted.key)
+                queueEvictions.incrementAndGet()
+                accepted = taskQueue.offerFirst(job)
+            }
+        }
+        if (accepted) scheduled.incrementAndGet()
+        else {
+            pending.remove(key)
+            queueEvictions.incrementAndGet()
+        }
+        persistDiagnostic()
     }
 
     private fun redrawMessage(id: Long) {
@@ -614,7 +954,7 @@ class WonderTranslate : Plugin() {
             for (entry in adapter.internalData) {
                 val message = (entry as? MessageEntry)?.message ?: continue
                 if (message.channelId == channel && !message.isLoading) {
-                    enqueue(message.id, channel, message.content ?: "")
+                    enqueue(message.id, channel, message.content ?: "", urgent = false)
                 }
             }
         } catch (t: Throwable) {
@@ -638,5 +978,6 @@ class WonderTranslate : Plugin() {
 
     companion object {
         private const val BUTTON_TAG = "wondertranslate:toggle:r16"
+        private const val COMPOSER_TAG = "wondertranslate:toggle:r23:composer"
     }
 }

@@ -2,58 +2,57 @@
 
 # WonderTranslate
 
-### Tradução automática para Aliucord, com um toque.
+### Tradução automática para Aliucord Legacy, com um toque.
 
-![Versão](https://img.shields.io/badge/VERSÃO-0.1.5-2563EB?style=for-the-badge)
-![Estado](https://img.shields.io/badge/ESTADO-DESENVOLVIMENTO-F59E0B?style=for-the-badge)
+![Versão](https://img.shields.io/badge/VERSÃO-0.1.13-2563EB?style=for-the-badge)
+![Estado](https://img.shields.io/badge/ESTADO-PREVIEW-F59E0B?style=for-the-badge)
 ![Plataforma](https://img.shields.io/badge/PLATAFORMA-ANDROID-3DDC84?style=for-the-badge)
 
-**Mensagens em outros idiomas, exibidas dentro do chat.**
+**Converse sem barreiras de idioma.**
 
-**[⬇️ Baixar WonderTranslate 0.1.5](https://github.com/wonderkast02/WonderTranslate/releases/download/v0.1.5/WonderTranslate-0.1.5.zip)** · [Código-fonte](plugins/WonderTranslate/src/main/kotlin/dev/wonderkast/wondertranslate)
+### [⬇️ Baixar WonderTranslate](https://github.com/wonderkast02/WonderTranslate/releases/download/v0.1.13/WonderTranslate.zip)
+
+`WonderTranslate.zip` · Instalação direta · Atualizações pelo Aliucord
 
 </div>
 
 ---
 
-> [!WARNING]
-> **Pré-lançamento experimental, não uma versão estável.** Funcional no dispositivo testado; a compatibilidade com outras versões do Aliucord não está garantida.
+> [!NOTE]
+> **Pré-lançamento experimental.** Testado no Aliucord Legacy (Discord `126021` / Aliucord `2.9.1`). Não há garantia de compatibilidade universal.
 
 ## ✨ Recursos
 
-- **🌐 ON/OFF:** um toque ativa ou desativa a tradução, inclusive em canais somente leitura.
-- **Automático:** traduz as mensagens já carregadas e as novas mensagens; o histórico mais antigo é processado conforme for carregado ao rolar.
-- **Idiomas:** detecção automática da origem, português brasileiro como destino padrão e opção de trocar o idioma.
-- **Texto original preservado:** a tradução aparece somente no seu aparelho; não envia mensagens ao Discord.
+- **🌐 ON/OFF:** ative e desative a tradução com um toque, preservando os textos originais.
+- **Sem interrupções:** traduz mensagens carregadas e recebidas; prioriza o conteúdo visível.
+- **Todos os tipos de canal:** botão na barra de digitação ou no alto dos canais somente leitura/anúncios.
+- **12 idiomas de destino:** pressione e segure 🌐 para escolher, inclusive português e russo.
+- **Formatação protegida:** tratamento específico para URLs, menções e blocos de código.
 
-## ⬇️ Instalação
+## ⬇️ Instalação e atualizações
 
-1. Use o **Aliucord Legacy** no Android (base Discord `126021`; Aliucord `2.9.1` ou compatível).
-2. Baixe o [ZIP do plugin](https://github.com/wonderkast02/WonderTranslate/releases/download/v0.1.5/WonderTranslate-0.1.5.zip) e copie-o como `WonderTranslate.zip` para a pasta `Aliucord/plugins` do armazenamento interno.
-3. Abra ou reinicie o Aliucord. Toque em **🌐 OFF** para ativar e aceite o aviso de tradução externa. Segure 🌐 para escolher o idioma.
+1. Baixe **[WonderTranslate.zip](https://github.com/wonderkast02/WonderTranslate/releases/download/v0.1.13/WonderTranslate.zip)**.
+2. Copie diretamente para `Aliucord/plugins` no armazenamento interno **sem renomear**.
+3. Reinicie o Aliucord, abra um chat, toque em **🌐 OFF** e autorize a tradução externa.
 
-> **Privacidade:** quando você autoriza a tradução, o conteúdo das mensagens traduzidas é enviado a `translate.googleapis.com` por uma interface não oficial, sujeita a mudanças e limites. Evite usar em conversas sensíveis. Anexos, imagens e textos de histórico ainda não carregado não são traduzidos.
+Para receber atualizações futuras pelo próprio Aliucord, abra **Configurações → Aliucord → Automatically update plugins**. A verificação também está disponível em **Aliucord → Updater**.
 
-**SHA-256 do ZIP 0.1.5:** `e453ef4162206ecdd3f845b42ad6e022830880733e80e719dad196108dbf4df9`
+> **Privacidade:** após consentimento, o texto das mensagens traduzidas é enviado a `translate.googleapis.com` por endpoint não oficial. Evite conteúdo sensível; imagens e anexos não são traduzidos.
+
+**SHA-256 (v0.1.13):** `ab7c603f12979562d4f2c1dccd9cd0b43a6a5a03e806eca2c85a4a4ff803abba`
 
 ## 🛠️ Compilação
 
-Java 21 + Android SDK 36. O script usa o [template oficial do Aliucord](https://github.com/Aliucord/plugins-template):
-
-```bash
-bash build_from_template.sh
-```
-
-O ZIP resultante fica em `.build/aliucord-template/plugins/WonderTranslate/build/outputs/WonderTranslate.zip`.
+Código-fonte em [`plugins/WonderTranslate`](plugins/WonderTranslate). Requer Java 21 e Android SDK 36; use `bash build_from_template.sh`.
 
 ---
 
 <div align="center">
 
-**WonderTranslate · by [wonderkast02](https://github.com/wonderkast02)**
+**WonderTranslate** · desenvolvido por [wonderkast02](https://github.com/wonderkast02)
 
-Feito para a comunidade Aliucord. Referências técnicas: [Aliucord](https://github.com/Aliucord) · [Translate](https://github.com/TymanWasTaken/aliucord-plugins/tree/master/Translate).
+Baseado no ecossistema aberto [Aliucord](https://github.com/Aliucord) · [Translate](https://github.com/TymanWasTaken/aliucord-plugins/tree/master/Translate)
 
-*Projeto independente, não oficial do Discord, Aliucord ou Google.*
+*Projeto independente; não afiliado a Discord, Aliucord ou Google.*
 
 </div>
