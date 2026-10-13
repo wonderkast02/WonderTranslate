@@ -1,9 +1,9 @@
 {
   "WonderTranslate": {
-    "version": "0.1.13",
-    "build": "https://github.com/wonderkast02/WonderTranslate/releases/download/v0.1.13/WonderTranslate.zip",
-    "buildCrc32": "3F2BAC74",
-    "changelog": "0.1.13: tradução automática, botões em canais com escrita e somente leitura, proteção de formatação e suporte ao atualizador nativo.",
+    "version": "0.1.14",
+    "build": "https://github.com/wonderkast02/WonderTranslate/releases/download/v0.1.14/WonderTranslate.zip",
+    "buildCrc32": "AA791903",
+    "changelog": "0.1.14 (R31): teste da atualização automática nativa do Aliucord; código Kotlin idêntico à 0.1.13.",
     "minimumDiscordVersion": 126021,
     "minimumAliucordVersion": "2.9.1",
     "minimumKotlinVersion": "1.5.21",
