@@ -4,13 +4,13 @@
 
 ### Tradução automática para Aliucord Legacy, com um toque.
 
-![Versão](https://img.shields.io/badge/VERSÃO-0.1.13-2563EB?style=for-the-badge)
+![Versão](https://img.shields.io/badge/VERSÃO-0.1.14-2563EB?style=for-the-badge)
 ![Estado](https://img.shields.io/badge/ESTADO-PREVIEW-F59E0B?style=for-the-badge)
 ![Plataforma](https://img.shields.io/badge/PLATAFORMA-ANDROID-3DDC84?style=for-the-badge)
 
 **Converse sem barreiras de idioma.**
 
-### [⬇️ Baixar WonderTranslate](https://github.com/wonderkast02/WonderTranslate/releases/download/v0.1.13/WonderTranslate.zip)
+### [⬇️ Baixar WonderTranslate](https://github.com/wonderkast02/WonderTranslate/releases/download/v0.1.14/WonderTranslate.zip)
 
 `WonderTranslate.zip` · Instalação direta · Atualizações pelo Aliucord
 
@@ -31,15 +31,17 @@
 
 ## ⬇️ Instalação e atualizações
 
-1. Baixe **[WonderTranslate.zip](https://github.com/wonderkast02/WonderTranslate/releases/download/v0.1.13/WonderTranslate.zip)**.
+1. Baixe **[WonderTranslate.zip](https://github.com/wonderkast02/WonderTranslate/releases/download/v0.1.14/WonderTranslate.zip)**.
 2. Copie diretamente para `Aliucord/plugins` no armazenamento interno **sem renomear**.
 3. Reinicie o Aliucord, abra um chat, toque em **🌐 OFF** e autorize a tradução externa.
+
+**O R31 mantém o mesmo motor de tradução da 0.1.13; esta versão valida o fluxo de atualização nativo.**
 
 Para receber atualizações futuras pelo próprio Aliucord, abra **Configurações → Aliucord → Automatically update plugins**. A verificação também está disponível em **Aliucord → Updater**.
 
 > **Privacidade:** após consentimento, o texto das mensagens traduzidas é enviado a `translate.googleapis.com` por endpoint não oficial. Evite conteúdo sensível; imagens e anexos não são traduzidos.
 
-**SHA-256 (v0.1.13):** `ab7c603f12979562d4f2c1dccd9cd0b43a6a5a03e806eca2c85a4a4ff803abba`
+**SHA-256 (v0.1.14):** `aeed506fb15d7545bc480811606a53ec6ec82ae9652edda13f9a2d80a651a581`
 
 ## 🛠️ Compilação
 
